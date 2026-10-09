@@ -7,6 +7,8 @@ import {
     type RejectedDocument,
     type TranslationDocument,
 } from '../Model/TraducModel';
+import VoiceReadController from '../Controller/VoiceReadControlller';
+import DocumentReader from '../Controller/DocumentReader';
 import './TraducView.css';
 
 export type TraducViewProps = {
@@ -18,19 +20,22 @@ export type TraducViewProps = {
     sourceLanguage: string;
     targetLanguage: string;
     compress: boolean;
-    activeSection: 'translate' | 'library' | 'chats';
+    activeSection: 'translate' | 'voice' | 'library' | 'chats';
     storageError?: string;
     onSourceLanguageChange: (language: string) => void;
     onTargetLanguageChange: (language: string) => void;
     onSwapLanguages: () => void;
     onCompressChange: (compress: boolean) => void;
     onFilesSelected: (files: FileList | File[]) => void;
-    onSendChat: (message: string, action?: 'chat' | 'summary') => void;
+    onSendChat: (message: string, action?: 'chat' | 'summary', attachments?: File[]) => Promise<boolean>;
     onClearChat: () => void;
     onStartTranslation: (id: string) => void;
     onDownload: (id: string, kind: DocumentFileKind) => void;
+    onOpenDocument: (id: string) => void;
+    readerDocument?: { document: TranslationDocument; file: Blob };
+    onCloseReader: () => void;
     onRemoveDocument: (id: string) => void;
-    onSectionChange: (section: 'translate' | 'library' | 'chats') => void;
+    onSectionChange: (section: 'translate' | 'voice' | 'library' | 'chats') => void;
     onDismissRejection: (index: number) => void;
 };
 
@@ -57,16 +62,24 @@ const TraducView: React.FC<TraducViewProps> = ({
     onClearChat,
     onStartTranslation,
     onDownload,
+    onOpenDocument,
+    readerDocument,
+    onCloseReader,
     onRemoveDocument,
     onSectionChange,
     onDismissRejection,
 }) => {
     const inputRef = useRef<HTMLInputElement>(null);
+    const chatFileInputRef = useRef<HTMLInputElement>(null);
     const chatEndRef = useRef<HTMLDivElement>(null);
     const [isDragging, setIsDragging] = useState(false);
+    const [isChatDragging, setIsChatDragging] = useState(false);
+    const [chatAttachments, setChatAttachments] = useState<File[]>([]);
+    const [chatAttachmentError, setChatAttachmentError] = useState<string>();
     const [theme, setTheme] = useState<'light' | 'dark'>('light');
     const isLibrary = activeSection === 'library';
     const isChat = activeSection === 'chats';
+    const isVoice = activeSection === 'voice';
     const [chatInput, setChatInput] = useState('');
     const processingCount = documents.filter((document) => document.status === 'processing').length;
 
@@ -96,11 +109,54 @@ const TraducView: React.FC<TraducViewProps> = ({
         chatEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
     }, [chatMessages, chatLoading, isChat]);
 
-    const handleChatSubmit = (event: FormEvent<HTMLFormElement>) => {
+    const handleChatSubmit = async (event: FormEvent<HTMLFormElement>) => {
         event.preventDefault();
-        if (!chatInput.trim() || chatLoading) return;
-        onSendChat(chatInput);
-        setChatInput('');
+        if ((!chatInput.trim() && chatAttachments.length === 0) || chatLoading) return;
+        const message = chatInput.trim() || 'Revisa los documentos adjuntos y ayúdame con su contenido.';
+        const sent = await onSendChat(message, 'chat', chatAttachments);
+        if (sent) {
+            setChatInput('');
+            setChatAttachments([]);
+            setChatAttachmentError(undefined);
+            if (chatFileInputRef.current) chatFileInputRef.current.value = '';
+        }
+    };
+
+    const handleChatFiles = (files: FileList | File[]) => {
+        const supportedExtensions = new Set(['.pdf', '.docx', '.xlsx']);
+        const maxFileSize = 20 * 1024 * 1024;
+        const accepted: File[] = [];
+        const rejected: string[] = [];
+        const next = [...chatAttachments];
+
+        for (const file of Array.from(files)) {
+            const extension = file.name.slice(file.name.lastIndexOf('.')).toLowerCase();
+            if (!supportedExtensions.has(extension)) {
+                rejected.push(`${file.name}: usa PDF, DOCX o XLSX.`);
+            } else if (file.size === 0) {
+                rejected.push(`${file.name}: el archivo está vacío.`);
+            } else if (file.size > maxFileSize) {
+                rejected.push(`${file.name}: el máximo es 20 MB por archivo.`);
+            } else {
+                if (next.some((item) => item.name === file.name && item.size === file.size)) continue;
+                if (next.length >= 3) {
+                    rejected.push('Puedes adjuntar hasta 3 documentos por mensaje.');
+                    break;
+                }
+                accepted.push(file);
+                next.push(file);
+            }
+        }
+
+        if (accepted.length > 0) setChatAttachments(next);
+        setChatAttachmentError(rejected.length ? rejected.join(' ') : undefined);
+    };
+
+    const clearChat = () => {
+        onClearChat();
+        setChatAttachments([]);
+        setChatAttachmentError(undefined);
+        if (chatFileInputRef.current) chatFileInputRef.current.value = '';
     };
 
     return (
@@ -127,6 +183,14 @@ const TraducView: React.FC<TraducViewProps> = ({
                             <path d="M3.8 12h16.4M12 3.5c2.1 2.3 3.1 5.1 3.1 8.5s-1 6.2-3.1 8.5c-2.1-2.3-3.1-5.1-3.1-8.5s1-6.2 3.1-8.5Z" />
                         </svg>
                         Traducir
+                    </button>
+                    <button
+                        className={`traduc-nav-item${isVoice ? ' is-active' : ''}`}
+                        onClick={() => onSectionChange('voice')}
+                        type="button"
+                    >
+                        <span aria-hidden="true">♫</span>
+                        Traducir audio
                     </button>
                     <button
                         className={`traduc-nav-item${isLibrary ? ' is-active' : ''}`}
@@ -182,22 +246,24 @@ const TraducView: React.FC<TraducViewProps> = ({
 
             <section className="traduc-main">
                 <header className="traduc-heading">
-                    <h1>{isChat ? 'Chat IA' : isLibrary ? 'Librería de documentos' : 'Traducir documentos'}</h1>
+                    <h1>{isChat ? 'Chat IA' : isLibrary ? 'Librería de documentos' : isVoice ? 'Traducir audio' : 'Traducir documentos'}</h1>
                     <p>
                         {isChat
                             ? 'Conversa, resuelve dudas y resume tus ideas con Gemini.'
-                            : 'PDF, Word y Excel. DeepL conserva el formato del documento durante la traducción.'}
+                            : isVoice
+                                ? 'Transcribe y traduce tus grabaciones de audio con DeepL Voice.'
+                                : 'PDF, Word y Excel. DeepL conserva el formato del documento durante la traducción.'}
                     </p>
                 </header>
 
-                {storageError && !isChat && (
+                {storageError && !isChat && !isVoice && (
                     <p className="traduc-storage-error" role="alert">{storageError}</p>
                 )}
                 {chatError && isChat && (
                     <p className="traduc-storage-error" role="alert">{chatError}</p>
                 )}
 
-                {!isLibrary && !isChat && (
+                {!isLibrary && !isChat && !isVoice && (
                     <section className="traduc-upload-panel" aria-label="Opciones para traducir">
                         <div className="traduc-controls">
                             <div className="traduc-language-controls">
@@ -276,7 +342,34 @@ const TraducView: React.FC<TraducViewProps> = ({
                 )}
 
                 {isChat ? (
-                    <section className="traduc-chat-shell" aria-label="Asistente de chat">
+                    <section
+                        className={`traduc-chat-shell${isChatDragging ? ' is-dragging' : ''}`}
+                        aria-label="Asistente de chat"
+                        onDragEnter={(event) => {
+                            if (event.dataTransfer.types.includes('Files')) {
+                                event.preventDefault();
+                                setIsChatDragging(true);
+                            }
+                        }}
+                        onDragOver={(event) => {
+                            if (event.dataTransfer.types.includes('Files')) event.preventDefault();
+                        }}
+                        onDragLeave={(event) => {
+                            if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+                                setIsChatDragging(false);
+                            }
+                        }}
+                        onDrop={(event) => {
+                            event.preventDefault();
+                            setIsChatDragging(false);
+                            handleChatFiles(event.dataTransfer.files);
+                        }}
+                    >
+                        {isChatDragging && (
+                            <div className="traduc-chat-drop-overlay" aria-live="polite">
+                                Suelta aquí tus documentos PDF, DOCX o XLSX
+                            </div>
+                        )}
                         <div className="traduc-chat-toolbar">
                             <div className="traduc-chat-assistant">
                                 <span className="traduc-ai-avatar" aria-hidden="true">✦</span>
@@ -294,7 +387,7 @@ const TraducView: React.FC<TraducViewProps> = ({
                                 <button
                                     type="button"
                                     className="traduc-chat-tool"
-                                    onClick={onClearChat}
+                                    onClick={clearChat}
                                     disabled={chatLoading || chatMessages.length === 0}
                                 >
                                     Nuevo chat
@@ -323,6 +416,13 @@ const TraducView: React.FC<TraducViewProps> = ({
                                         {message.role === 'assistant' && <span className="traduc-message-avatar" aria-hidden="true">✦</span>}
                                         <div className="traduc-message-content">
                                             <span className="traduc-message-author">{message.role === 'user' ? 'Tú' : 'Gemini'}</span>
+                                            {message.attachments && message.attachments.length > 0 && (
+                                                <div className="traduc-chat-message-attachments">
+                                                    {message.attachments.map((attachment) => (
+                                                        <span key={`${message.id}-${attachment.name}`}>▤ {attachment.name}</span>
+                                                    ))}
+                                                </div>
+                                            )}
                                             <p>{message.content}</p>
                                         </div>
                                     </article>
@@ -340,7 +440,37 @@ const TraducView: React.FC<TraducViewProps> = ({
                             <div ref={chatEndRef} />
                         </div>
 
-                        <form className="traduc-chat-form" onSubmit={handleChatSubmit}>
+                        <form className={`traduc-chat-form${chatAttachments.length ? ' has-attachments' : ''}`} onSubmit={handleChatSubmit}>
+                            <input
+                                ref={chatFileInputRef}
+                                className="traduc-visually-hidden"
+                                type="file"
+                                accept=".pdf,.docx,.xlsx"
+                                multiple
+                                disabled={chatLoading}
+                                onChange={(event) => {
+                                    if (event.currentTarget.files) handleChatFiles(event.currentTarget.files);
+                                    event.currentTarget.value = '';
+                                }}
+                            />
+                            {chatAttachments.length > 0 && (
+                                <div className="traduc-chat-attachments" aria-label="Documentos adjuntos">
+                                    {chatAttachments.map((attachment) => (
+                                        <span className="traduc-chat-attachment" key={`${attachment.name}-${attachment.size}`}>
+                                            <span aria-hidden="true">▤</span>
+                                            <span>{attachment.name}</span>
+                                            <button
+                                                type="button"
+                                                onClick={() => setChatAttachments((current) => current.filter((item) => item !== attachment))}
+                                                aria-label={`Quitar ${attachment.name}`}
+                                                disabled={chatLoading}
+                                            >
+                                                ×
+                                            </button>
+                                        </span>
+                                    ))}
+                                </div>
+                            )}
                             <textarea
                                 value={chatInput}
                                 onChange={(event) => setChatInput(event.target.value)}
@@ -356,12 +486,33 @@ const TraducView: React.FC<TraducViewProps> = ({
                                 maxLength={8000}
                                 disabled={chatLoading}
                             />
-                            <button type="submit" className="traduc-chat-send" disabled={chatLoading || !chatInput.trim()} aria-label="Enviar mensaje">
+                            <button
+                                type="button"
+                                className="traduc-chat-attach"
+                                onClick={() => chatFileInputRef.current?.click()}
+                                disabled={chatLoading}
+                                aria-label="Adjuntar documentos"
+                                title="Adjuntar PDF, DOCX o XLSX"
+                            >
+                                <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                                    <path d="m20.5 11.5-8.2 8.2a5 5 0 0 1-7.1-7.1l9.2-9.2a3.3 3.3 0 0 1 4.7 4.7l-9.2 9.2a1.7 1.7 0 0 1-2.4-2.4l8.2-8.2" />
+                                </svg>
+                            </button>
+                            <button type="submit" className="traduc-chat-send" disabled={chatLoading || (!chatInput.trim() && chatAttachments.length === 0)} aria-label="Enviar mensaje">
                                 ↑
                             </button>
-                            <small>Los mensajes se procesan con Gemini. Verifica la información importante.</small>
+                            <small className={chatAttachmentError ? 'has-error' : undefined} role={chatAttachmentError ? 'alert' : undefined}>
+                                {chatAttachmentError || 'Adjunta hasta 3 PDF, DOCX o XLSX · máximo 20 MB c/u. Gemini procesa su texto.'}
+                            </small>
                         </form>
                     </section>
+                ) : isVoice ? (
+                    <VoiceReadController
+                        sourceLanguage={sourceLanguage}
+                        targetLanguage={targetLanguage}
+                        onSourceLanguageChange={onSourceLanguageChange}
+                        onTargetLanguageChange={onTargetLanguageChange}
+                    />
                 ) : (
                 <section className="traduc-processing" aria-live="polite">
                     <h2>
@@ -407,6 +558,21 @@ const TraducView: React.FC<TraducViewProps> = ({
                                     </div>
                                     {document.error && <p className="traduc-document-error" role="alert">{document.error}</p>}
                                     <div className="traduc-document-actions">
+                                        {isLibrary && (
+                                            <button
+                                                type="button"
+                                                className="traduc-action-secondary traduc-read-document"
+                                                onClick={() => onOpenDocument(document.id)}
+                                                aria-label={`Abrir y leer ${document.name}`}
+                                                title="Abrir y leer documento"
+                                            >
+                                                <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                                                    <path d="M2.5 12s3.4-6 9.5-6 9.5 6 9.5 6-3.4 6-9.5 6-9.5-6-9.5-6Z" />
+                                                    <circle cx="12" cy="12" r="2.7" />
+                                                </svg>
+                                                <span>Abrir y leer</span>
+                                            </button>
+                                        )}
                                         <button type="button" className="traduc-action-secondary" onClick={() => onDownload(document.id, 'original')}>
                                             Descargar original
                                         </button>
@@ -428,6 +594,14 @@ const TraducView: React.FC<TraducViewProps> = ({
                 </section>
                 )}
             </section>
+
+            {readerDocument && (
+                <DocumentReader
+                    document={readerDocument.document}
+                    file={readerDocument.file}
+                    onClose={onCloseReader}
+                />
+            )}
 
         </main>
     );

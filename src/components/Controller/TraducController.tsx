@@ -15,6 +15,7 @@ import {
     type RejectedDocument,
     type TranslationDocument,
 } from '../Model/TraducModel';
+import { extractDocumentText } from '../Model/DocumentText';
 import TraducView, { type TraducViewProps } from '../View/TraducView';
 
 const delay = (milliseconds: number) => new Promise((resolve) => window.setTimeout(resolve, milliseconds));
@@ -34,11 +35,12 @@ function TraducController() {
     const [sourceLanguage, setSourceLanguage] = useState('es');
     const [targetLanguage, setTargetLanguage] = useState('en');
     const [compress, setCompress] = useState(false);
-    const [activeSection, setActiveSection] = useState<'translate' | 'library' | 'chats'>('translate');
+    const [activeSection, setActiveSection] = useState<'translate' | 'voice' | 'library' | 'chats'>('translate');
     const [storageError, setStorageError] = useState<string>();
     const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
     const [chatLoading, setChatLoading] = useState(false);
     const [chatError, setChatError] = useState<string>();
+    const [readerDocument, setReaderDocument] = useState<{ document: TranslationDocument; file: Blob }>();
     const documentsRef = useRef<TranslationDocument[]>([]);
     const chatMessagesRef = useRef<ChatMessage[]>([]);
     const activeJobs = useRef(new Set<string>());
@@ -207,6 +209,21 @@ function TraducController() {
         }
     };
 
+    const handleOpenDocument = async (id: string) => {
+        const document = documentsRef.current.find((item) => item.id === id);
+        if (!document) return;
+        try {
+            const file = await getDocumentFile(id, 'original');
+            if (!file) throw new Error('No se encontró el documento en el almacenamiento local.');
+            setReaderDocument({ document, file });
+            setStorageError(undefined);
+        } catch (error) {
+            setStorageError(error instanceof Error ? error.message : 'No se pudo abrir el documento.');
+        }
+    };
+
+    const handleCloseReader = useCallback(() => setReaderDocument(undefined), []);
+
     const handleRemoveDocument = async (id: string) => {
         try {
             await deleteDocumentFiles(id);
@@ -216,18 +233,52 @@ function TraducController() {
         }
     };
 
-    const handleSendChat: TraducViewProps['onSendChat'] = async (message, action = 'chat') => {
-        if (chatLoading) return;
+    const handleSendChat: TraducViewProps['onSendChat'] = async (message, action = 'chat', files = []) => {
+        if (chatLoading) return false;
         const trimmed = message.trim();
-        if (action === 'chat' && !trimmed) return;
+        if (action === 'chat' && !trimmed && files.length === 0) return false;
+        if (action === 'summary' && chatMessagesRef.current.length === 0) return false;
+
+        setChatLoading(true);
+        setChatError(undefined);
+        const supportedExtensions = new Set(['.pdf', '.docx', '.xlsx']);
+        const attachments: NonNullable<ChatMessage['attachments']> = [];
+        let totalAttachmentTextLength = 0;
+        try {
+            for (const file of files) {
+                const extension = file.name.slice(file.name.lastIndexOf('.')).toLowerCase();
+                if (!supportedExtensions.has(extension)) throw new Error(`${file.name}: usa PDF, DOCX o XLSX.`);
+                if (file.size === 0) throw new Error(`${file.name}: el archivo está vacío.`);
+                if (file.size > 20 * 1024 * 1024) throw new Error(`${file.name}: el máximo para el chat es 20 MB.`);
+
+                const content = await extractDocumentText(file, file.name);
+                if (!content.trim()) throw new Error(`${file.name}: no se encontró texto legible. Los PDF escaneados requieren OCR.`);
+                if (content.length > 30_000) throw new Error(`${file.name}: su texto supera el máximo de 30.000 caracteres.`);
+                totalAttachmentTextLength += content.length;
+                if (totalAttachmentTextLength > 60_000) {
+                    throw new Error('El texto total adjunto supera el máximo de 60.000 caracteres por mensaje.');
+                }
+                attachments.push({ name: file.name, content });
+            }
+        } catch (error) {
+            setChatError(error instanceof Error ? error.message : 'No se pudieron leer los documentos adjuntos.');
+            setChatLoading(false);
+            return false;
+        }
 
         const userMessage: ChatMessage | undefined = action === 'chat'
-            ? { id: crypto.randomUUID(), role: 'user', content: trimmed, createdAt: Date.now() }
+            ? {
+                id: crypto.randomUUID(),
+                role: 'user',
+                content: trimmed || 'Revisa los documentos adjuntos y ayúdame con su contenido.',
+                createdAt: Date.now(),
+                attachments: attachments.length > 0 ? attachments : undefined,
+            }
             : undefined;
         const conversation = userMessage
             ? [...chatMessagesRef.current, userMessage]
             : chatMessagesRef.current;
-        if (conversation.length === 0) return;
+        if (conversation.length === 0) return false;
 
         if (userMessage) commitChatMessages(conversation);
         setChatLoading(true);
@@ -238,7 +289,11 @@ function TraducController() {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     action,
-                    messages: conversation.slice(-24).map(({ role, content }) => ({ role, content })),
+                    messages: conversation.slice(-24).map(({ role, content, attachments: messageAttachments }) => ({
+                        role,
+                        content,
+                        ...(messageAttachments ? { attachments: messageAttachments } : {}),
+                    })),
                 }),
             });
             if (!response.ok) throw new Error(await responseError(response));
@@ -248,8 +303,10 @@ function TraducController() {
                 ...chatMessagesRef.current,
                 { id: crypto.randomUUID(), role: 'assistant', content: result.answer, createdAt: Date.now() },
             ]);
+            return true;
         } catch (error) {
             setChatError(error instanceof Error ? error.message : 'No se pudo obtener una respuesta de Gemini.');
+            return false;
         } finally {
             setChatLoading(false);
         }
@@ -283,6 +340,9 @@ function TraducController() {
             onClearChat={handleClearChat}
             onStartTranslation={handleStartTranslation}
             onDownload={handleDownload}
+            onOpenDocument={(id) => void handleOpenDocument(id)}
+            readerDocument={readerDocument}
+            onCloseReader={handleCloseReader}
             onRemoveDocument={(id) => void handleRemoveDocument(id)}
             onSectionChange={setActiveSection}
             onDismissRejection={(index) => setRejectedDocuments((current) => current.filter((_, itemIndex) => itemIndex !== index))}

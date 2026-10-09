@@ -5,6 +5,7 @@ export type ChatMessage = {
     role: 'user' | 'assistant';
     content: string;
     createdAt: number;
+    attachments?: Array<{ name: string; content: string }>;
 };
 
 export type TranslationDocument = {
