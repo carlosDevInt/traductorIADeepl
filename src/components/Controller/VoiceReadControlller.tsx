@@ -1,0 +1,1 @@
+//aqui va el codigo de la logica del componente de lectura de voz con modelo de voice deepltransler

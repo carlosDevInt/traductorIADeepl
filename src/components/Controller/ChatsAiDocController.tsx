@@ -1,0 +1,2 @@
+// aqui va el codigo de la logica del componente de chats con modelo de ai doc
+//este controller pasara la logica de la api de ai doc a un componente de react para poder usarlo en el frontend utilizando el modelo de ai doc para generar respuestas a partir de prompts y mensajes previos
